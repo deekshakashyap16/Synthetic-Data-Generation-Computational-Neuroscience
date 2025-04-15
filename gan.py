@@ -50,13 +50,19 @@ batch_size = 5
 noise = torch.randn(batch_size, signal_length, noise_dim)
 fake_eeg_data = generator(noise).detach()
 
-# Plot Fake EEG Signals
 plt.figure(figsize=(10, 5))
+
+batch_size = fake_eeg_data.shape[0]
+
 for i in range(batch_size):
-    plt.plot(fake_eeg_data[i].squeeze().numpy(), label=f"Sample {i+1}")
+    # Remove extra dimensions like [128, 1] -> [128]
+    signal = fake_eeg_data[i].squeeze().detach().cpu().numpy()
+
+    plt.plot(signal, label=f"Sample {i+1}")
 
 plt.title("Generated Fake EEG Signals")
 plt.xlabel("Timestep")
 plt.ylabel("Amplitude")
 plt.legend()
+plt.tight_layout()
 plt.show()
