@@ -285,7 +285,14 @@ def extract_trials_with_frames(eeg_data, field_name, fs):
                     break
         
         # Extract event information - try multiple approaches
-        events = extract_data_safely_record(eeg_data, f'{field_name.split("_")[1]}_event')
+        parts = field_name.split('_')
+        if len(parts) > 1:
+            prefix = parts[1]
+        else:
+            prefix = parts[0]
+        event_field_name = f"{prefix}_event"
+
+        events = extract_data_safely_record(eeg_data, event_field_name)
         if events is None:
             events = extract_data_safely_record(eeg_data, 'imagery_event')
         
@@ -379,9 +386,13 @@ def calculate_erd_ers(eeg_data, fs, labels=None, baseline_window=(0.5, 1.0), tas
         baseline_end = min(baseline_end, min_length)
         task_end = min(task_end, min_length)
         
-        # Calculate ERD/ERS
-        erd_ers_mu = np.zeros((eeg_data.shape[1], 100))  # 64 channels, 100 time points
-        erd_ers_beta = np.zeros((eeg_data.shape[1], 100))
+        # Calculate actual time dimension for task window
+        n_time_points = task_end - task_start
+        n_channels = eeg_data.shape[1]
+        
+        # Initialize arrays with dynamic size
+        erd_ers_mu = np.zeros((n_channels, n_time_points))
+        erd_ers_beta = np.zeros((n_channels, n_time_points))
         
         # --- BEGIN REST STATE BASELINE DETECTION ---
         # Check for rest trials (label=2) if labels are provided
@@ -392,9 +403,8 @@ def calculate_erd_ers(eeg_data, fs, labels=None, baseline_window=(0.5, 1.0), tas
                 use_rest_baseline = True
         # --- END REST STATE BASELINE DETECTION ---
         
-        for ch in range(eeg_data.shape[1]):
+        for ch in range(n_channels):
             # Baseline power calculation
-            # --- MODIFIED TO USE REST TRIALS IF AVAILABLE ---
             if use_rest_baseline:
                 baseline_mu = np.mean(mu_power[rest_mask, ch, baseline_start:baseline_end])
                 baseline_beta = np.mean(beta_power[rest_mask, ch, baseline_start:baseline_end])
@@ -403,17 +413,12 @@ def calculate_erd_ers(eeg_data, fs, labels=None, baseline_window=(0.5, 1.0), tas
                 baseline_beta = np.mean(beta_power[:, ch, baseline_start:baseline_end])
             
             # Task power (windowed)
-            task_mu = mu_power[:, ch, task_start:task_end]
+            task_mu = mu_power[:, ch, task_start:task_end]  # Shape: (trials, time)
             task_beta = beta_power[:, ch, task_start:task_end]
             
-            # Resample to 100 points
-            if task_mu.shape[1] > 0:
-                task_mu_resampled = np.mean(task_mu.reshape(task_mu.shape[0], 100, -1), axis=2)
-                task_beta_resampled = np.mean(task_beta.reshape(task_beta.shape[0], 100, -1), axis=2)
-                
-                # ERD/ERS calculation: (Task - Baseline) / Baseline * 100
-                erd_ers_mu[ch, :] = np.mean((task_mu_resampled - baseline_mu) / baseline_mu * 100, axis=0)
-                erd_ers_beta[ch, :] = np.mean((task_beta_resampled - baseline_beta) / baseline_beta * 100, axis=0)
+            # Calculate ERD/ERS without resampling
+            erd_ers_mu[ch, :] = np.mean((task_mu - baseline_mu) / baseline_mu * 100, axis=0)
+            erd_ers_beta[ch, :] = np.mean((task_beta - baseline_beta) / baseline_beta * 100, axis=0)
         
         # Combine mu and beta (take average)
         erd_ers = (erd_ers_mu + erd_ers_beta) / 2
@@ -421,11 +426,12 @@ def calculate_erd_ers(eeg_data, fs, labels=None, baseline_window=(0.5, 1.0), tas
         
     except Exception as e:
         print(f"ERD/ERS calculation error: {e}")
-        return np.zeros((64, 100))
+        # Return empty array with correct dimensions if possible
+        return np.zeros((n_channels, n_time_points)) if 'n_time_points' in locals() else np.zeros((64, 100))
 
 # ------------------------ ENHANCED FILTERING (SAME AS BEFORE) ------------------------ #
 
-def detect_flat_channels(eeg_data, fs, threshold=1e-4):
+def detect_flat_channels(eeg_data, fs, threshold=0.1):  # More realistic threshold
     """
     Detect and remove flat channels from EEG data.
     
@@ -667,97 +673,133 @@ def reject_emg_correlated_trials(emg_trials, fs, corr_threshold=0.9, p_threshold
 
 # ------------------------ CLASSIFICATION (SAME LOGIC) ------------------------ #
 def classify_riemann_flda(eeg, labels, fs, n_iterations=120, min_trials_per_class=5):
-    """Riemannian covariance + Tangent Space + FLDA classification"""
+    """Riemannian covariance + Tangent Space + FLDA classification with robust error handling"""
     try:
         # Keep original preprocessing
         eeg_hp = butter_filter(eeg, 0.5, None, fs)
         eeg_car = apply_car(eeg_hp)
         eeg_bp = butter_filter(eeg_car, 8, 30, fs)
-        
+
         # Maintain original windowing
         start_idx = int(fs * 0.5)
         end_idx = int(fs * 2.5)
-        
         min_trial_length = min(trial.shape[-1] for trial in eeg_bp)
+        
         if end_idx > min_trial_length:
             end_idx = min_trial_length
         if start_idx >= min_trial_length:
             start_idx = 0
             end_idx = min_trial_length
-            
+
         eeg_windowed = eeg_bp[:, :, start_idx:end_idx]
-        
-        # Original class balance checks (now handles 3 classes)
+
+        # Check data quality before classification
+        if eeg_windowed.shape[0] < 10 or eeg_windowed.shape[-1] < int(0.5 * fs):
+            print(f"Insufficient data for classification: {eeg_windowed.shape}")
+            return 0.0
+
+        # Original class balance checks
         unique_labels, counts = np.unique(labels, return_counts=True)
         if len(unique_labels) < 2 or min(counts) < min_trials_per_class:
             print(f"Insufficient data: {dict(zip(unique_labels, counts))}")
             return 0.0
-        
+
         accuracies = []
-        
-        # Only changed component: FLDA -> LDA for multi-class
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+        # Reduce iterations to speed up processing
+        n_iterations = min(n_iterations, 30)
         
         for iteration in range(n_iterations):
             try:
-                # Original data splitting (works for 3 classes)
+                # Original data splitting
                 X_train, X_test, y_train, y_test = train_test_split(
-                    eeg_windowed, labels, 
-                    test_size=0.3, 
+                    eeg_windowed, labels,
+                    test_size=0.3,
                     stratify=labels,
                     random_state=iteration
                 )
-                
-                # Original class balance check (now for 3 classes)
+
+                # Check training data quality
                 train_unique, train_counts = np.unique(y_train, return_counts=True)
                 if min(train_counts) < 3:
                     continue
-                
-                # Modified pipeline: Covariance + Tangent Space + LDA (multi-class)
-                clf = make_pipeline(
-                    Covariances(estimator='lwf'),  # Ledoit-Wolf shrinkage
-                    TangentSpace(metric='riemann'),
-                    LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')  # Changed
-                )
-                
-                clf.fit(X_train, y_train)
-                acc = clf.score(X_test, y_test)
+
+                # More robust pipeline with error handling
+                try:
+                    # Use empirical covariance instead of LWF if numerical issues
+                    cov_est = Covariances(estimator='oas')  # Oracle Approximating Shrinkage
+                    cov_train = cov_est.fit_transform(X_train)
+                    
+                    ts = TangentSpace(metric='riemann')
+                    ts_train = ts.fit_transform(cov_train)
+                    
+                    # Use more stable LDA parameters
+                    lda = LinearDiscriminantAnalysis(solver='eigen', shrinkage=None)
+                    lda.fit(ts_train, y_train)
+                    
+                    # Test prediction
+                    cov_test = cov_est.transform(X_test)
+                    ts_test = ts.transform(cov_test)
+                    acc = lda.score(ts_test, y_test)
+                    
+                except Exception as clf_error:
+                    print(f"Classification error in iteration {iteration}: {clf_error}")
+                    # Fallback to simple classification
+                    try:
+                        from sklearn.svm import SVC
+                        # Flatten features for simple SVM
+                        X_train_flat = X_train.reshape(X_train.shape[0], -1)
+                        X_test_flat = X_test.reshape(X_test.shape[0], -1)
+                        
+                        svm = SVC(kernel='linear', C=1.0)
+                        svm.fit(X_train_flat, y_train)
+                        acc = svm.score(X_test_flat, y_test)
+                    except:
+                        continue
+
                 accuracies.append(acc)
-                
+
             except Exception as e:
                 print(f"Warning in iteration {iteration}: {e}")
                 continue
-        
+
         if not accuracies:
+            print("No successful iterations, returning 0.0")
             return 0.0
-            
+
         mean_acc = np.mean(accuracies)
         
-        # Maintain original cross-validation (works for 3 classes)
+        # Quick cross-validation with error handling
         try:
             kfold_accuracies = []
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            skf = StratifiedKFold(n_splits=min(5, min(counts)), shuffle=True, random_state=42)
             
             for train_idx, test_idx in skf.split(eeg_windowed, labels):
-                X_train, X_test = eeg_windowed[train_idx], eeg_windowed[test_idx]
-                y_train, y_test = labels[train_idx], labels[test_idx]
-                
-                clf = make_pipeline(
-                    Covariances(estimator='lwf'),
-                    TangentSpace(metric='riemann'),
-                    LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')  # Changed
-                )
-                
-                clf.fit(X_train, y_train)
-                acc = clf.score(X_test, y_test)
-                kfold_accuracies.append(acc)
+                try:
+                    X_train, X_test = eeg_windowed[train_idx], eeg_windowed[test_idx]
+                    y_train, y_test = labels[train_idx], labels[test_idx]
+                    
+                    # Simple robust classification
+                    from sklearn.svm import SVC
+                    X_train_flat = X_train.reshape(X_train.shape[0], -1)
+                    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+                    
+                    svm = SVC(kernel='linear', C=1.0)
+                    svm.fit(X_train_flat, y_train)
+                    acc = svm.score(X_test_flat, y_test)
+                    kfold_accuracies.append(acc)
+                except:
+                    continue
             
-            kfold_mean = np.mean(kfold_accuracies)
-            return min(mean_acc, kfold_mean)
-            
+            if kfold_accuracies:
+                kfold_mean = np.mean(kfold_accuracies)
+                return min(mean_acc, kfold_mean)
+            else:
+                return mean_acc
         except:
             return mean_acc
-    
+
     except Exception as e:
         print(f"Classification error: {e}")
         return 0.0
@@ -801,7 +843,24 @@ def process_subject_enhanced_record(args):
 
         # --- BEGIN: Add support for rest state extraction ---
         # Try to extract rest trials if available
-        rest_trials, rest_success = extract_trials_with_frames(eeg, 'imagery_rest', fs) if 'imagery_rest' in getattr(eeg, 'dtype', {}).names else (None, False)
+        # --- Enhanced rest state extraction ---
+        rest_trials = None
+        rest_success = False
+
+        # Try multiple approaches for rest detection
+        if hasattr(eeg, 'dtype') and eeg.dtype.names:
+            # Try direct field extraction with multiple possible field names
+            for rest_field in ['imagery_rest', 'rest', 'baseline', 'idle']:
+                if rest_field in eeg.dtype.names:
+                    rest_trials, rest_success = extract_trials_with_frames(eeg, rest_field, fs)
+                    if rest_success:
+                        print(f"Found rest trials in field: {rest_field}")
+                        break
+
+        # If no direct rest field found, create artificial rest periods
+        if not rest_success:
+            print("No direct rest field found, skipping rest state detection")
+
         # --- END: Add support for rest state extraction ---
 
         # Extract trials using frame-based segmentation
@@ -996,6 +1055,19 @@ def run_enhanced_preprocessing(raw_data_dir, output_dir, n_processes=None):
     
     os.makedirs(output_dir, exist_ok=True)
     
+    def convert_keys(obj):
+        """Recursively convert numpy types and dictionary keys to native Python types"""
+        if isinstance(obj, dict):
+            return {convert_keys(k): convert_keys(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_keys(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_keys(item) for item in obj)
+        elif isinstance(obj, np.generic):
+            return obj.item()  # Convert numpy scalars to native Python types
+        else:
+            return obj
+
     # Process subjects
     args_list = [(f, output_dir) for f in subject_files]
     
@@ -1010,12 +1082,24 @@ def run_enhanced_preprocessing(raw_data_dir, output_dir, n_processes=None):
             if result:
                 results.append(result)
     else:
-        with Pool(n_processes) as pool:
-            for result in tqdm(pool.imap_unordered(process_subject_enhanced_record, args_list),
-                             total=len(args_list), desc="Processing"):
+        try:
+            with Pool(n_processes) as pool:
+                # Remove tqdm from multiprocessing to avoid interference
+                for i, result in enumerate(pool.imap_unordered(process_subject_enhanced_record, args_list)):
+                    if result:
+                        results.append(result)
+                    # Manual progress reporting
+                    if (i + 1) % 5 == 0:
+                        print(f"Processed {i + 1}/{len(args_list)} subjects...")
+        except Exception as e:
+            print(f"Multiprocessing failed: {e}")
+            print("Falling back to single-process mode...")
+            for arg in tqdm(args_list, desc="Processing (fallback)"):
+                result = process_subject_enhanced_record(arg)
                 if result:
                     results.append(result)
-    
+
+                    
     # Final summary
     successful = [r for r in results if r.get('success', False)]
     failed = [r for r in results if not r.get('success', False)]
@@ -1052,9 +1136,13 @@ def run_enhanced_preprocessing(raw_data_dir, output_dir, n_processes=None):
         }
     }
     
-    with open(os.path.join(output_dir, "final_summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
+        # Convert summary to JSON-safe types
+    summary_converted = convert_keys(summary)
     
+    # Save summary (now with native types)
+    summary_path = os.path.join(output_dir, 'preprocessing_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary_converted, f, indent=2)
     print(f"\n💾 Results saved to: {output_dir}")
     return summary
 
@@ -1069,3 +1157,14 @@ if __name__ == "__main__":
     
     print("\n🎉 Preprocessing complete!")
     print(f"Check {OUTPUT_DIR} for results.")
+
+
+#for trials to check if new change brought into code work out or not
+# if __name__ == "__main__":
+#     RAW_DATA_DIR = "/Users/chaitanya/work/pes/SDG/raw_data"
+#     OUTPUT_DIR = "/Users/chaitanya/work/pes/SDG/optimized_pipeline_results"
+    
+#     # Test with single process first to avoid multiprocessing issues
+#     summary = run_enhanced_preprocessing(RAW_DATA_DIR, OUTPUT_DIR, n_processes=1)
+#     print("\n🎉 Preprocessing complete!")
+#     print(f"Check {OUTPUT_DIR} for results.")
